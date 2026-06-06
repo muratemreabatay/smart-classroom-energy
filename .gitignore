@@ -1,0 +1,9 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Gizli kimlik bilgileri (Google Sheets vb.)
+credentials.json

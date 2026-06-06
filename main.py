@@ -1,12 +1,78 @@
 import customtkinter as ctk
 import random
 import time
+import threading
+
+# pyserial opsiyonel: kurulu değilse uygulama yine açılır, sadece sensör çalışmaz.
+try:
+    import serial
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
 
 # --- Yapılandırma ---
 TOTAL_CHAIRS = 100
 ROWS = 10
 COLS = 10
 UPDATE_INTERVAL_MS = 2000
+
+# --- Sensör (Arduino seri port) ---
+# Windows'ta COM7. Mac'te "/dev/cu.usbserial-XXXX", Linux'ta "/dev/ttyUSB0" gibidir.
+SERIAL_PORT = "COM7"
+BAUD_RATE = 115200
+# Sensör verisi yalnızca bu amfiye bağlanır; diğerleri simülasyon kalır.
+SENSOR_AMPHI = "Amfi 101"
+
+
+class SensorReader:
+    """Arduino'dan seri port üzerinden CSV (sicaklik,nem,hava,isik) okur.
+
+    Arka planda bir thread'de çalışır, böylece GUI donmaz. Arduino bağlı
+    değilse veya port açılamazsa çökmez; bağlanınca otomatik okumaya başlar.
+    """
+
+    def __init__(self, port=SERIAL_PORT, baud=BAUD_RATE):
+        self.port = port
+        self.baud = baud
+        self.latest = None          # {"temp","humidity","air","light"}
+        self.status = "waiting"     # waiting | live | error
+        self.error = None
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        if not SERIAL_AVAILABLE:
+            self.status = "error"
+            self.error = "pyserial kurulu değil (pip install pyserial)"
+            return
+
+        while not self._stop:
+            try:
+                ser = serial.Serial(self.port, self.baud, timeout=2)
+                time.sleep(2)  # Arduino reset/stabilizasyon
+                self.status = "waiting"
+                self.error = None
+                while not self._stop:
+                    line = ser.readline().decode("utf-8", errors="ignore").strip()
+                    if not line:
+                        continue
+                    parts = line.split(",")
+                    if len(parts) != 4:
+                        continue
+                    try:
+                        t, h, air, light = map(float, parts)
+                    except ValueError:
+                        continue
+                    self.latest = {"temp": t, "humidity": h, "air": air, "light": light}
+                    self.status = "live"
+            except Exception as e:
+                self.status = "error"
+                self.error = str(e)
+                time.sleep(3)  # portu tekrar açmayı dene
+
+    def stop(self):
+        self._stop = True
 
 POWER_RATES = {
     'LIGHTING_PER_ZONE': 3.5 / 4,
@@ -15,15 +81,19 @@ POWER_RATES = {
 }
 
 class AmphiTab(ctk.CTkFrame):
-    def __init__(self, parent, amphi_name):
+    def __init__(self, parent, amphi_name, sensor=None):
         super().__init__(parent, fg_color="transparent")
         self.amphi_name = amphi_name
-        
+        self.sensor = sensor  # None ise saf simülasyon, değilse gerçek sensör
+
         # State
         self.app_state = {
             "occupied": 0,
             "out_temp": 24.5,
             "out_humidity": 45,
+            "air_quality": 0.0,
+            "light": 0.0,
+            "sensor_status": "sim",  # sim | live | waiting | error
             "zones_active": [False, False, False, False],
             "ac_power_percent": 0,
             "is_power_active": False,
@@ -124,10 +194,16 @@ class AmphiTab(ctk.CTkFrame):
         # Çevre Verileri
         self.env_frame = ctk.CTkFrame(self.right_frame, fg_color="#0f172a", corner_radius=10)
         self.env_frame.pack(fill="x", padx=15, pady=5)
+        self.sensor_status_label = ctk.CTkLabel(self.env_frame, text="", font=("Inter", 11, "bold"))
+        self.sensor_status_label.pack(pady=(8, 2))
         self.temp_label = ctk.CTkLabel(self.env_frame, text="Dış Sıcaklık: -- °C", font=("Inter", 13))
         self.temp_label.pack(pady=5)
         self.humidity_label = ctk.CTkLabel(self.env_frame, text="Dış Nem: -- %", font=("Inter", 13))
         self.humidity_label.pack(pady=5)
+        self.air_label = ctk.CTkLabel(self.env_frame, text="Hava Kalitesi: -- ", font=("Inter", 13))
+        self.air_label.pack(pady=5)
+        self.light_label_env = ctk.CTkLabel(self.env_frame, text="Işık: -- lux", font=("Inter", 13))
+        self.light_label_env.pack(pady=(5, 8))
 
         # Durum Göstergeleri
         self.sys_frame = ctk.CTkFrame(self.right_frame, fg_color="#0f172a", corner_radius=10)
@@ -238,6 +314,20 @@ class AmphiTab(ctk.CTkFrame):
         self.update_ui()
 
     def update_ui(self):
+        status = self.app_state["sensor_status"]
+        if status == "sim":
+            self.sensor_status_label.configure(text="⚪ Simülasyon Verisi", text_color="gray")
+            self.air_label.configure(text="Hava Kalitesi: — (sensör yok)", text_color="gray")
+            self.light_label_env.configure(text="Işık: — (sensör yok)", text_color="gray")
+        elif status == "live":
+            self.sensor_status_label.configure(text=f"🟢 Canlı Sensör ({SERIAL_PORT})", text_color="#10b981")
+            self.air_label.configure(text=f"Hava Kalitesi: {int(self.app_state['air_quality'])}", text_color="#f59e0b")
+            self.light_label_env.configure(text=f"Işık: {int(self.app_state['light'])} lux", text_color="#facc15")
+        elif status == "waiting":
+            self.sensor_status_label.configure(text="🟡 Sensör bekleniyor...", text_color="#facc15")
+        else:  # error
+            self.sensor_status_label.configure(text="🔴 Sensör bağlı değil", text_color="#ef4444")
+
         self.temp_label.configure(text=f"Dış Sıcaklık: {self.app_state['out_temp']:.1f} °C")
         self.humidity_label.configure(text=f"Dış Nem: {int(self.app_state['out_humidity'])} %")
         self.occupancy_label.configure(text=f"Doluluk: {self.app_state['occupied']} / {TOTAL_CHAIRS}")
@@ -256,10 +346,23 @@ class AmphiTab(ctk.CTkFrame):
         self.smart_energy_label.configure(text=f"Toplam: {self.app_state['total_energy_kwh']:.3f} kWh")
 
     def simulate_environment(self):
-        temp_change = (random.random() - 0.5) * 0.4
-        self.app_state["out_temp"] = max(15.0, min(40.0, self.app_state["out_temp"] + temp_change))
-        hum_change = random.choice([-1, 0, 1])
-        self.app_state["out_humidity"] = max(20, min(80, self.app_state["out_humidity"] + hum_change))
+        if self.sensor is not None:
+            # Gerçek sensör: random yerine Arduino'dan gelen değerleri kullan.
+            reading = self.sensor.latest
+            if reading is not None:
+                self.app_state["out_temp"] = reading["temp"]
+                self.app_state["out_humidity"] = reading["humidity"]
+                self.app_state["air_quality"] = reading["air"]
+                self.app_state["light"] = reading["light"]
+            self.app_state["sensor_status"] = self.sensor.status
+        else:
+            # Saf simülasyon (sensörü olmayan amfiler).
+            temp_change = (random.random() - 0.5) * 0.4
+            self.app_state["out_temp"] = max(15.0, min(40.0, self.app_state["out_temp"] + temp_change))
+            hum_change = random.choice([-1, 0, 1])
+            self.app_state["out_humidity"] = max(20, min(80, self.app_state["out_humidity"] + hum_change))
+            self.app_state["sensor_status"] = "sim"
+
         self.update_system()
         self.accumulate_energy()
         self.after(UPDATE_INTERVAL_MS, self.simulate_environment)
@@ -310,15 +413,25 @@ class MultiAmphiApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
         
+        # Arduino sensörü (arka planda okur). Sadece SENSOR_AMPHI'ye bağlanır.
+        self.sensor = SensorReader()
+
         # Tabs Container
         self.tabview = ctk.CTkTabview(self)
         self.tabview.pack(fill="both", expand=True, padx=10, pady=10)
-        
+
         # Create 3 Tabs
         for name in ["Amfi 101", "Amfi 102", "Amfi 103"]:
             self.tabview.add(name)
-            tab_frame = AmphiTab(self.tabview.tab(name), name)
+            sensor = self.sensor if name == SENSOR_AMPHI else None
+            tab_frame = AmphiTab(self.tabview.tab(name), name, sensor=sensor)
             tab_frame.pack(fill="both", expand=True)
+
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def on_close(self):
+        self.sensor.stop()
+        self.destroy()
 
 if __name__ == "__main__":
     app = MultiAmphiApp()
